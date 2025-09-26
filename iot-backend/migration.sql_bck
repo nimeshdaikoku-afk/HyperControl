@@ -1,0 +1,42 @@
+-- Enable extensions (if not already)
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- =====================
+-- Devices table
+-- =====================
+CREATE TABLE IF NOT EXISTS devices (
+    id TEXT PRIMARY KEY,          -- device_id like "light123"
+    name TEXT,
+    latitude FLOAT,
+    longitude FLOAT,
+    jwt_token TEXT,
+    group_id TEXT
+);
+
+-- =====================
+-- Telemetry table
+-- =====================
+CREATE TABLE IF NOT EXISTS telemetry (
+    id BIGSERIAL PRIMARY KEY,
+    device_id TEXT REFERENCES devices(id) ON DELETE CASCADE,
+    ts TIMESTAMP DEFAULT NOW(),
+    topic TEXT,
+    payload JSONB
+);
+
+-- =====================
+-- Device status table
+-- =====================
+CREATE TABLE IF NOT EXISTS device_status (
+    device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+    led_status TEXT,
+    last_seen TIMESTAMP
+);
+
+-- =====================
+-- Indexes for performance
+-- =====================
+CREATE INDEX IF NOT EXISTS idx_telemetry_device_id ON telemetry(device_id);
+CREATE INDEX IF NOT EXISTS idx_telemetry_ts ON telemetry(ts);
+CREATE INDEX IF NOT EXISTS idx_device_status_id ON device_status(device_id);
+

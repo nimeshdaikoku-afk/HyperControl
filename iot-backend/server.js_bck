@@ -1,0 +1,455 @@
+// server.js
+const express = require("express");
+const cors = require("cors");
+const { Pool } = require("pg");
+const mqtt = require("mqtt");
+const crypto = require("crypto");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+/** ========== CONFIG - change as needed ========== **/
+const PORT = 4000;
+const DB_CONFIG = {
+  user: "iotuser",
+  host: "localhost",
+  database: "iotdb",
+  password: "iotpass",
+  port: 5432,
+};
+const MQTT_URL = "mqtt://localhost";
+const MQTT_USER = "neevDev";
+const MQTT_PASS = "Neev123#";
+// timeout waiting for device replies (ms)
+const DEFAULT_REPLY_TIMEOUT_MS = 5000;
+/** =============================================== **/
+
+const pool = new Pool(DB_CONFIG);
+
+// MQTT client
+const client = mqtt.connect(MQTT_URL, {
+  username: MQTT_USER,
+  password: MQTT_PASS,
+});
+
+// In-memory map to correlate msg_id -> {resolve, reject, timer}
+const pendingRequests = new Map();
+
+client.on("connect", () => {
+  console.log("MQTT connected");
+  // subscribe to boot and all device topics (token in middle position)
+  client.subscribe("neevrfc/boot");
+  client.subscribe("neevrfc/+/+/cmd");
+  client.subscribe("neevrfc/+/+/status");
+  client.subscribe("neevrfc/+/+/telemetry");
+  client.subscribe("neevrfc/group/+/cmd");
+});
+
+// helper: generate opaque token
+function generateOpaqueToken() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+// verify topic token; returns deviceId or null
+async function verifyTopic(topic) {
+  const parts = topic.split("/");
+  if (parts.length < 4) return null;
+  const device_id = parts[1];
+  const token = parts[2];
+
+  const { rows } = await pool.query("SELECT opaque_token FROM devices WHERE id=$1", [device_id]);
+  if (rows.length === 0) {
+    console.log("verifyTopic: no device found for", device_id);
+    return null;
+  }
+  const expected = (rows[0].opaque_token || "").trim();
+  const got = (token || "").trim();
+
+  if (expected !== got) {
+    // log lengths to debug invisible char issues
+    console.log("verifyTopic: token mismatch for", device_id);
+    console.log(" expected:", `"${expected}"`, "len:", expected.length);
+    console.log(" got     :", `"${got}"`, "len:", got.length);
+    return null;
+  }
+  return device_id;
+}
+
+// MQTT message handler
+client.on("message", async (topic, message) => {
+  try {
+    const payloadStr = message.toString();
+    // attempt parse JSON; keep raw fallback
+    let msg;
+    try { msg = JSON.parse(payloadStr); } catch (e) { msg = payloadStr; }
+
+    // boot: return opaque token
+    if (topic === "neevrfc/boot") {
+      if (typeof msg === "object" && msg.device_id) {
+        const deviceId = msg.device_id;
+        const { rows } = await pool.query("SELECT opaque_token FROM devices WHERE id=$1", [deviceId]);
+        if (rows.length > 0) {
+          client.publish(`neevrfc/${deviceId}/auth`, JSON.stringify({ token: rows[0].opaque_token }));
+          console.log(`Auth token sent to ${deviceId}`);
+        } else {
+          console.log(`Unregistered device boot attempt: ${deviceId}`);
+        }
+      }
+      return;
+    }
+
+    // parse device topics; verify token
+    const deviceId = await verifyTopic(topic);
+    if (!deviceId) {
+      // but we still want to show logs
+      console.log("Unauthorized/invalid topic:", topic, payloadStr);
+      return;
+    }
+
+    // status
+    if (topic.includes("/status")) {
+      const ledStatus = (msg && msg.LED_status) || "UNKNOWN";
+      const ts = (msg && msg.Time) ? new Date(msg.Time) : new Date();
+      await pool.query(
+        `INSERT INTO device_status (device_id, led_status, last_seen)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (device_id) DO UPDATE
+         SET led_status = EXCLUDED.led_status, last_seen = EXCLUDED.last_seen`,
+         [deviceId, ledStatus, ts]
+      );
+      console.log(`Status saved for ${deviceId}: ${ledStatus}`);
+      return;
+    }
+
+    // telemetry
+    if (topic.includes("/telemetry")) {
+      const ts = (msg && msg.Time) ? new Date(msg.Time) : new Date();
+      await pool.query(
+        "INSERT INTO telemetry (device_id, ts, topic, payload) VALUES ($1,$2,$3,$4::jsonb)",
+        [deviceId, ts, topic, JSON.stringify(msg)]
+      );
+      console.log(`Telemetry stored for ${deviceId} @ ${ts}`);
+      return;
+    }
+
+    // cmd topic: may be requests or responses
+    if (topic.includes("/cmd")) {
+      console.log("Cmd topic message from", deviceId, msg);
+
+      // if message has msg_id and origin == 'device', it's a response to some pending request
+      if (msg && msg.msg_id && msg.origin === "device") {
+        const entry = pendingRequests.get(msg.msg_id);
+        if (entry) {
+          clearTimeout(entry.timer);
+          pendingRequests.delete(msg.msg_id);
+          entry.resolve({ deviceId, msg });
+        }
+        // also if this is configdata or config dump, persist to device_config
+        if (typeof msg === "object" && !Array.isArray(msg)) {
+          // treat msg.data or msg as config
+          if (msg.cmd === "configdata" && msg.data) {
+            await pool.query(
+              `INSERT INTO device_config (device_id, config, updated_at)
+               VALUES ($1, $2::jsonb, NOW())
+               ON CONFLICT (device_id) DO UPDATE
+                 SET config = EXCLUDED.config, updated_at = NOW()`,
+               [deviceId, JSON.stringify(msg.data)]
+            );
+            console.log(`Config saved from device reply for ${deviceId}`);
+          } else if (!msg.cmd && (msg.Over_Voltage || msg.Under_Voltage || msg.Over_Load_Phase_1)) {
+            // device responded with direct config dump (no cmd field)
+            await pool.query(
+              `INSERT INTO device_config (device_id, config, updated_at)
+               VALUES ($1, $2::jsonb, NOW())
+               ON CONFLICT (device_id) DO UPDATE
+                 SET config = EXCLUDED.config, updated_at = NOW()`,
+               [deviceId, JSON.stringify(msg)]
+            );
+            console.log(`Config dump saved for ${deviceId}`);
+          }
+        }
+        return;
+      }
+
+      // if message is a command coming from device (e.g., setGroup), handle server-side actions
+      if (msg && msg.cmd) {
+        if (msg.cmd === "setGroup" && msg.data && msg.data.group_id) {
+          const group_id = msg.data.group_id;
+          const result = await pool.query(
+            "INSERT INTO groups (group_id) VALUES ($1) ON CONFLICT (group_id) DO UPDATE SET group_id=EXCLUDED.group_id RETURNING group_code",
+            [group_id]
+          );
+          const groupCode = result.rows[0].group_code;
+          await pool.query("UPDATE devices SET group_code=$1 WHERE id=$2", [groupCode, deviceId]);
+
+          // respond to device: setGroupCode
+          client.publish(`neevrfc/${deviceId}/${msg.token || ""}/cmd`, JSON.stringify({
+            cmd: "setGroupCode", data: { group_code: groupCode }
+          }));
+          console.log(`Group assigned for ${deviceId} -> ${group_id}(${groupCode})`);
+        }
+
+        // if device sends configdata as confirmation (without origin/msg_id), update DB
+        if (msg.cmd === "configdata" && msg.data) {
+          await pool.query(
+            `INSERT INTO device_config (device_id, config, updated_at)
+             VALUES ($1, $2::jsonb, NOW())
+             ON CONFLICT (device_id) DO UPDATE
+               SET config = EXCLUDED.config, updated_at = NOW()`,
+            [deviceId, JSON.stringify(msg.data)]
+          );
+          console.log(`Config updated for ${deviceId} (cmd path)`);
+        }
+
+        // if manual command produced a state change and device echoes it, update device_status
+        if (msg.cmd === "manual" && msg.data && typeof msg.data.lightOn !== "undefined") {
+          const newStatus = msg.data.lightOn;
+          await pool.query(
+            `INSERT INTO device_status (device_id, led_status, last_seen)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (device_id) DO UPDATE SET led_status=EXCLUDED.led_status, last_seen=EXCLUDED.last_seen`,
+            [deviceId, newStatus]
+          );
+          console.log(`Device ${deviceId} manual-ack -> ${newStatus}`);
+        }
+      }
+
+      return;
+    }
+
+    // group messages (admin -> group)
+    if (topic.startsWith("neevrfc/group/")) {
+      console.log("Group command received", topic, msg);
+      return;
+    }
+
+  } catch (err) {
+    console.error("Error processing MQTT:", err && err.message ? err.message : err);
+  }
+});
+
+/** =================== REST APIs =================== **/
+
+// Commission device
+app.post("/api/devices/commission", async (req, res) => {
+  try {
+    const { device_id, latitude = null, longitude = null, group_id = null } = req.body;
+    if (!device_id) return res.status(400).json({ error: "device_id required" });
+
+    const token = generateOpaqueToken();
+
+    let groupCode = null;
+    if (group_id) {
+      const result = await pool.query(
+        "INSERT INTO groups (group_id) VALUES ($1) ON CONFLICT (group_id) DO UPDATE SET group_id=EXCLUDED.group_id RETURNING group_code",
+        [group_id]
+      );
+      groupCode = result.rows[0].group_code;
+    }
+
+    await pool.query(
+      `INSERT INTO devices (id, name, latitude, longitude, opaque_token, group_code)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (id) DO UPDATE
+         SET latitude=EXCLUDED.latitude, longitude=EXCLUDED.longitude, opaque_token=EXCLUDED.opaque_token, group_code=EXCLUDED.group_code`,
+      [device_id, device_id, latitude, longitude, token, groupCode]
+    );
+
+    // initialize status to OFF if not present
+    await pool.query(
+      `INSERT INTO device_status (device_id, led_status, last_seen)
+       VALUES ($1, 'OFF', NOW())
+       ON CONFLICT (device_id) DO NOTHING`,
+      [device_id]
+    );
+
+    res.json({ device_id, token, group_code: groupCode });
+  } catch (err) {
+    console.error("Commission error:", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// Groups
+app.get("/api/groups", async (req, res) => {
+  const { rows } = await pool.query("SELECT * FROM groups ORDER BY group_code");
+  res.json(rows);
+});
+
+// Devices list (basic pagination & optional filters)
+app.get("/api/devices", async (req, res) => {
+  try {
+    const page = parseInt(req.query.page || "1", 10);
+    const limit = Math.min(parseInt(req.query.limit || "50", 10), 200);
+    const offset = (page - 1) * limit;
+
+    // simple filters: status, group_code, q
+    const filters = [];
+    const args = [];
+    if (req.query.q) {
+      args.push(`%${req.query.q}%`);
+      filters.push(`(d.id ILIKE $${args.length} OR d.name ILIKE $${args.length})`);
+    }
+    if (req.query.group_code) {
+      args.push(req.query.group_code);
+      filters.push(`d.group_code = $${args.length}`);
+    }
+    let where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+
+    const sql = `
+      SELECT d.id, d.name, d.latitude, d.longitude, d.group_code, g.group_id
+      FROM devices d
+      LEFT JOIN groups g ON d.group_code = g.group_code
+      ${where}
+      ORDER BY d.id
+      LIMIT $${args.length + 1} OFFSET $${args.length + 2}
+    `;
+    args.push(limit, offset);
+    const { rows } = await pool.query(sql, args);
+    res.json(rows);
+  } catch (err) {
+    console.error("GET /api/devices error", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// Devices status (normalized to id)
+app.get("/api/devices/status", async (req, res) => {
+  const { rows } = await pool.query("SELECT device_id AS id, led_status, last_seen FROM device_status ORDER BY device_id");
+  res.json(rows);
+});
+
+// Device telemetry
+app.get("/api/devices/:id/telemetry", async (req, res) => {
+  const id = req.params.id;
+  const { rows } = await pool.query(
+    `SELECT id AS telemetry_id, device_id AS id, ts, topic, payload
+     FROM telemetry WHERE device_id=$1 ORDER BY ts DESC LIMIT 20`, [id]
+  );
+  res.json(rows);
+});
+
+// Device config endpoint (triggers getconfigdata and waits for response up to timeout)
+app.get("/api/devices/:id/config", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { rows: devr } = await pool.query("SELECT opaque_token FROM devices WHERE id=$1", [id]);
+    if (devr.length === 0) return res.status(404).json({ error: "Device not found" });
+    const token = devr[0].opaque_token;
+
+    // create msg_id and publish getconfigdata
+    const msg_id = crypto.randomBytes(12).toString("hex");
+    const payload = { cmd: "getconfigdata", msg_id, origin: "ui", data: {} };
+
+    // setup promise to wait for device response
+    const p = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingRequests.delete(msg_id);
+        reject(new Error("timeout"));
+      }, DEFAULT_REPLY_TIMEOUT_MS);
+
+      pendingRequests.set(msg_id, { resolve, reject, timer });
+    });
+
+    client.publish(`neevrfc/${id}/${token}/cmd`, JSON.stringify(payload), (err) => {
+      if (err) {
+        pendingRequests.delete(msg_id);
+        return res.status(500).json({ error: "Failed to publish" });
+      }
+      // wait for response then return; note we cannot await p here because we must return response only after resolution
+      p.then(async (result) => {
+        // result.msg contains device reply
+        // return result.msg.data or result.msg as config
+        let configObj = result.msg.data || result.msg;
+        // ensure DB is updated (handler also stores it, but ensure idempotency)
+        await pool.query(
+          `INSERT INTO device_config (device_id, config, updated_at)
+           VALUES ($1, $2::jsonb, NOW())
+           ON CONFLICT (device_id) DO UPDATE
+             SET config=EXCLUDED.config, updated_at=NOW()`,
+          [id, JSON.stringify(configObj)]
+        );
+        res.json(configObj);
+      }).catch(async (err) => {
+        // if timeout, return last saved config from DB if present, otherwise 504
+        const { rows } = await pool.query("SELECT config FROM device_config WHERE device_id=$1", [id]);
+        if (rows.length > 0) {
+          res.json(rows[0].config);
+        } else {
+          res.status(504).json({ error: "Device did not respond in time" });
+        }
+      });
+    });
+
+  } catch (err) {
+    console.error("/api/devices/:id/config error", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// POST command (general) - adds msg_id & origin automatically for UI commands
+app.post("/api/devices/:id/command", async (req, res) => {
+  const id = req.params.id;
+  const { cmd, data } = req.body;
+  try {
+    const { rows } = await pool.query("SELECT opaque_token FROM devices WHERE id=$1", [id]);
+    if (rows.length === 0) return res.status(404).json({ error: "Device not found" });
+    const token = rows[0].opaque_token;
+    const msg_id = crypto.randomBytes(12).toString("hex");
+    const payload = { cmd, data: data || {}, origin: "ui", msg_id };
+
+    client.publish(`neevrfc/${id}/${token}/cmd`, JSON.stringify(payload), (err) => {
+      if (err) {
+        console.error("publish error:", err);
+        return res.status(500).json({ error: "Failed to publish" });
+      }
+      // stage config immediately if configdata command (optimistic)
+      (async () => {
+        if (cmd === "configdata") {
+          await pool.query(
+            `INSERT INTO device_config (device_id, config, updated_at)
+             VALUES ($1, $2::jsonb, NOW())
+             ON CONFLICT (device_id) DO UPDATE SET config=EXCLUDED.config, updated_at=NOW()`,
+            [id, JSON.stringify(data || {})]
+          );
+        }
+      })();
+
+      res.json({ success: true, msg_id });
+    });
+  } catch (err) {
+    console.error("/command error", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// summary KPIs
+app.get("/api/summary", async (req, res) => {
+  try {
+    const tot = await pool.query("SELECT count(*) FROM devices");
+    const online = await pool.query("SELECT count(*) FROM device_status WHERE led_status='ON'");
+    const offline = await pool.query("SELECT count(*) FROM device_status WHERE led_status='OFF' OR led_status='UNKNOWN'");
+    const alerts = await pool.query("SELECT count(*) FROM telemetry WHERE payload ? 'Alert_code'"); // example
+    res.json({
+      totalDevices: parseInt(tot.rows[0].count, 10),
+      devicesOnline: parseInt(online.rows[0].count, 10),
+      devicesOffline: parseInt(offline.rows[0].count, 10),
+      criticalAlerts: parseInt(alerts.rows[0].count, 10),
+    });
+  } catch (err) {
+    console.error("/api/summary error", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// get stored config (no request) - earlier endpoint for direct fetch
+app.get("/api/devices/:id/config/stored", async (req, res) => {
+  const { rows } = await pool.query("SELECT config FROM device_config WHERE device_id=$1", [req.params.id]);
+  if (rows.length === 0) return res.status(404).json({ error: "No config stored" });
+  res.json(rows[0].config);
+});
+
+/** start server **/
+app.listen(PORT, () => console.log(`Backend API running on port ${PORT}`));
+
