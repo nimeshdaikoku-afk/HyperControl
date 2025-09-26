@@ -5,16 +5,35 @@ const API_URL = "http://localhost:4000";
 
 export default function Devices() {
   const [devices, setDevices] = useState([]);
+  const [deviceStatus, setDeviceStatus] = useState({});
+  const [groups, setGroups] = useState({});
   const [selected, setSelected] = useState(null);
   const [telemetry, setTelemetry] = useState([]);
   const [configText, setConfigText] = useState("");
 
-  // Load devices (with group + status)
+  // Load devices + status + groups
   useEffect(() => {
     async function loadDevices() {
       try {
-        const fullRes = await axios.get(`${API_URL}/api/devices/full`);
-        setDevices(fullRes.data);
+        const devicesRes = await axios.get(`${API_URL}/api/devices`);
+        const statusRes = await axios.get(`${API_URL}/api/devices/status`);
+        const groupsRes = await axios.get(`${API_URL}/api/groups`);
+
+        // Build status map keyed by device id
+        const statusMap = {};
+        statusRes.data.forEach(s => {
+          statusMap[s.device_id] = s.led_status;
+        });
+
+        // Build group map keyed by group_code
+        const groupMap = {};
+        groupsRes.data.forEach(g => {
+          groupMap[g.group_code] = g.group_id;
+        });
+
+        setDevices(devicesRes.data);
+        setDeviceStatus(statusMap);
+        setGroups(groupMap);
       } catch (err) {
         console.error("Error loading devices:", err.message);
       }
@@ -37,7 +56,7 @@ export default function Devices() {
     axios
       .post(`${API_URL}/api/devices/${selected}/command`, {
         cmd: "manual",
-        data: { lightOn: state },
+        data: { lightOn: state }
       })
       .then(() => alert(`Sent light ${state}`));
   };
@@ -53,7 +72,7 @@ export default function Devices() {
     axios
       .post(`${API_URL}/api/devices/${selected}/command`, {
         cmd: "configdata",
-        data: configObj,
+        data: configObj
       })
       .then(() => alert("Config sent"));
   };
@@ -62,7 +81,7 @@ export default function Devices() {
     axios
       .post(`${API_URL}/api/devices/${selected}/command`, {
         cmd: "defaultEEPROM",
-        data: {},
+        data: {}
       })
       .then(() => alert("Default EEPROM sent"));
   };
@@ -80,31 +99,36 @@ export default function Devices() {
       <div className="w-64 border-r border-gray-700 pr-4 overflow-y-auto">
         <h3 className="font-semibold mb-2">Devices</h3>
         <ul className="space-y-1">
-          {devices.map(d => (
-            <li
-              key={d.id}
-              onClick={() => setSelected(d.id)}
-              className={`cursor-pointer px-2 py-1 rounded ${
-                d.id === selected ? "bg-hyper-card" : ""
-              }`}
-            >
-              {d.id}{" "}
-              <span
-                className={`ml-1 text-sm ${
-                  d.led_status === "ON"
-                    ? "text-green-400"
-                    : d.led_status === "OFF"
-                    ? "text-red-400"
-                    : "text-gray-400"
+          {devices.map(d => {
+            const status = deviceStatus[d.id] || "UNKNOWN";
+            const groupName = groups[d.group_code] || "NoGroup";
+
+            return (
+              <li
+                key={d.id}
+                onClick={() => setSelected(d.id)}
+                className={`cursor-pointer px-2 py-1 rounded ${
+                  d.id === selected ? "bg-hyper-card" : ""
                 }`}
               >
-                ({d.led_status || "UNKNOWN"})
-              </span>{" "}
-              <span className="text-xs text-hyper-secondaryText">
-                [{d.group_name || "NoGroup"}]
-              </span>
-            </li>
-          ))}
+                {d.id}{" "}
+                <span
+                  className={`ml-1 text-sm ${
+                    status === "ON"
+                      ? "text-green-400"
+                      : status === "OFF"
+                      ? "text-red-400"
+                      : "text-gray-400"
+                  }`}
+                >
+                  ({status})
+                </span>{" "}
+                <span className="text-xs text-hyper-secondaryText">
+                  [{groupName}]
+                </span>
+              </li>
+            );
+          })}
         </ul>
       </div>
 
@@ -194,3 +218,4 @@ export default function Devices() {
     </div>
   );
 }
+

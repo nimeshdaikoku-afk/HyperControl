@@ -1,9 +1,5 @@
-/** @type {import('tailwindcss').Config} */
-export default {
-  content: [
-    "./index.html",
-    "./src/**/*.{js,jsx,ts,tsx}"
-  ],
+module.exports = {
+  content: ["./index.html", "./src/**/*.{js,jsx,ts,tsx}"],
   theme: {
     extend: {
       colors: {
@@ -13,10 +9,10 @@ export default {
           bg: "#121212",
           card: "#1e1e1e",
           lightText: "#eeeeee",
-          secondaryText: "#aaaaaa",
-        },
-      },
-    },
+          secondaryText: "#aaaaaa"
+        }
+      }
+    }
   },
   plugins: [],
 };

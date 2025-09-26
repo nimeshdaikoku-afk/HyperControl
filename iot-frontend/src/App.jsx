@@ -1,7 +1,39 @@
+import { Routes, Route, Link } from "react-router-dom";
+import Dashboard from "./pages/Dashboard.jsx";
+import Devices from "./pages/Devices.jsx";
+import CommissionPage from "./pages/CommissionPage.jsx";
+
 export default function App() {
   return (
-    <div className="h-screen w-screen bg-hyper-bg flex items-center justify-center">
-      <h1 className="text-hyper-primary text-4xl font-bold">Hello Hyperdash 🚀</h1>
+    <div className="h-screen w-screen flex bg-hyper-bg text-hyper-lightText">
+      {/* Sidebar */}
+      <aside className="w-64 bg-hyper-dark flex flex-col">
+        <div className="p-6 flex items-center border-b border-gray-700">
+          <span className="text-xl font-bold text-hyper-primary">
+            Hyperdash IoT
+          </span>
+        </div>
+        <nav className="flex-1 p-4 space-y-2">
+          <Link to="/" className="block px-3 py-2 rounded hover:bg-hyper-card">
+            Dashboard
+          </Link>
+          <Link to="/devices" className="block px-3 py-2 rounded hover:bg-hyper-card">
+            Devices
+          </Link>
+          <Link to="/commission" className="block px-3 py-2 rounded hover:bg-hyper-card">
+            Commission
+          </Link>
+        </nav>
+      </aside>
+
+      {/* Main Content */}
+      <main className="flex-1 p-6 overflow-y-auto">
+        <Routes>
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/devices" element={<Devices />} />
+          <Route path="/commission" element={<CommissionPage />} />
+        </Routes>
+      </main>
     </div>
   );
 }
